@@ -15,7 +15,8 @@ from jmclient.configure import jm_single, get_log
 from jmclient.output import fmt_tx_data
 from jmclient.blockchaininterface import (INF_HEIGHT, BitcoinCoreInterface,
     BitcoinCoreNoHistoryInterface)
-from jmbase.support import jmprint, EXIT_SUCCESS
+from jmbase.support import jmprint, EXIT_SUCCESS, utxo_to_utxostr, bintohex, hextobin
+from jmbitcoin import lx
 """Wallet service
 
 The purpose of this independent service is to allow
@@ -175,7 +176,9 @@ class WalletService(Service):
             self.bci.import_addresses([address], self.EXTERNAL_WALLET_LABEL,
                                   restart_cb=self.restart_callback)
 
-    def default_autofreeze_warning_cb(self, utxostr):
+    def default_autofreeze_warning_cb(self, utxo):
+        success, utxostr = utxo_to_utxostr(utxo)
+        assert success, "Autofreeze warning cb called with invalid utxo."
         jlog.warning("WARNING: new utxo has been automatically "
              "frozen to prevent forced address reuse: ")
         jlog.warning(utxostr)
@@ -219,9 +222,7 @@ class WalletService(Service):
                 utxo]["value"] <= freeze_threshold:
                 # freezing of coins must be communicated to user:
                 self.autofreeze_warning_cb(utxo)
-                # process_new_tx returns added utxos in str format:
-                txidstr, idx = utxo.split(":")
-                self.disable_utxo(binascii.unhexlify(txidstr), int(idx))
+                self.disable_utxo(*utxo)
 
     def transaction_monitor(self):
         """Keeps track of any changes in the wallet (new transactions).
@@ -246,7 +247,7 @@ class WalletService(Service):
 
         for tx in new_txs:
             txid = tx["txid"]
-            res = self.bci.get_transaction(txid)
+            res = self.bci.get_transaction(hextobin(txid))
             if not res:
                 continue
             confs = res["confirmations"]
@@ -265,7 +266,7 @@ class WalletService(Service):
             txd = self.bci.get_deser_from_gettransaction(res)
             if txd is None:
                 continue
-            removed_utxos, added_utxos = self.wallet.process_new_tx(txd, txid, height)
+            removed_utxos, added_utxos = self.wallet.process_new_tx(txd, height)
             if txid not in self.processed_txids:
                 # apply checks to disable/freeze utxos to reused addrs if needed:
                 self.check_for_reuse(added_utxos)
@@ -296,7 +297,7 @@ class WalletService(Service):
             # dicts. (This is needed because txid is not always available
             # at the time of callback registration).
             possible_keys = [txid, tuple(
-                    (x["script"], x["value"]) for x in txd["outs"])]
+                    (str(x.scriptPubKey), x.nValue) for x in txd.vout)]
 
             # note that len(added_utxos) > 0 is not a sufficient condition for
             # the tx being new, since wallet.add_new_utxos will happily re-add
@@ -354,8 +355,9 @@ class WalletService(Service):
         def report_changed(x, utxos):
             if len(utxos.keys()) > 0:
                 jlog.info(x + ' utxos=\n{}'.format('\n'.join(
-                    '{} - {}'.format(u, fmt_tx_data(tx_data, self))
-                    for u, tx_data in utxos.items())))
+                    '{} - {}'.format(utxo_to_utxostr(u)[1],
+                        fmt_tx_data(tx_data, self)) for u,
+                    tx_data in utxos.items())))
 
         report_changed("Removed", removed_utxos)
         report_changed("Added", added_utxos)
@@ -619,14 +621,15 @@ class WalletService(Service):
     def _add_unspent_txo(self, utxo, height):
         """
         Add a UTXO as returned by rpc's listunspent call to the wallet.
-
+        Note that these are returned as little endian outpoint txids, so
+        are converted.
         params:
             utxo: single utxo dict as returned by listunspent
             current_blockheight: blockheight as integer, used to
             set the block in which a confirmed utxo is included.
         """
-        txid = binascii.unhexlify(utxo['txid'])
-        script = binascii.unhexlify(utxo['scriptPubKey'])
+        txid = hextobin(utxo['txid'])
+        script = hextobin(utxo['scriptPubKey'])
         value = int(Decimal(str(utxo['amount'])) * Decimal('1e8'))
         self.add_utxo(txid, int(utxo['vout']), script, value, height)
 
@@ -641,11 +644,9 @@ class WalletService(Service):
         self.wallet.save()
 
     def get_utxos_by_mixdepth(self, include_disabled=False,
-                              verbose=False, hexfmt=True, includeconfs=False):
+                              verbose=False, includeconfs=False):
         """ Returns utxos by mixdepth in a dict, optionally including
         information about how many confirmations each utxo has.
-        TODO clean up underlying wallet.get_utxos_by_mixdepth (including verbosity
-        and formatting options) to make this less confusing.
         """
         def height_to_confs(x):
             # convert height entries to confirmations:
@@ -660,21 +661,18 @@ class WalletService(Service):
                         confs = self.current_blockheight - h + 1
                     ubym_conv[m][u]["confs"] = confs
             return ubym_conv
-
-        if hexfmt:
-            ubym = self.wallet.get_utxos_by_mixdepth(verbose=verbose,
-                                                     includeheight=includeconfs)
-            if not includeconfs:
-                return ubym
-            else:
-                return height_to_confs(ubym)
-        else:
-            ubym = self.wallet.get_utxos_by_mixdepth_(
+        ubym = self.wallet.get_utxos_by_mixdepth(
             include_disabled=include_disabled, includeheight=includeconfs)
-            if not includeconfs:
-                return ubym
-            else:
-                return height_to_confs(ubym)
+        if not includeconfs:
+            return ubym
+        else:
+            return height_to_confs(ubym)
+
+    def minconfs_to_maxheight(self, minconfs):
+        if minconfs is None:
+            return None
+        else:
+            return self.current_blockheight - minconfs + 1
 
     def select_utxos(self, mixdepth, amount, utxo_filter=None, select_fn=None,
                      minconfs=None):
@@ -684,12 +682,27 @@ class WalletService(Service):
         require a minimum of minconfs confirmations (default none means
         unconfirmed are allowed).
         """
-        if minconfs is None:
-            maxheight = None
-        else:
-            maxheight = self.current_blockheight - minconfs + 1
         return self.wallet.select_utxos(mixdepth, amount, utxo_filter=utxo_filter,
-                                    select_fn=select_fn, maxheight=maxheight)
+                select_fn=select_fn, maxheight=self.minconfs_to_maxheight(minconfs))
+
+    def select_utxos_textkeyed(self, mixdepth, amount, utxo_filter=None, select_fn=None,
+                     minconfs=None):
+        """ As for select_utxos, but with two changes in return value:
+        (1) return 'address' key in result dict
+        (2) keys for dict are hexlified txid:n instead of (txid bytes, int).
+        """
+        utxo_filter_new = None
+        if utxo_filter:
+            utxo_filter_new = [(unhexlify(utxo[:64]), int(utxo[65:]))
+                               for utxo in utxo_filter]
+        ret = self.select_utxos(mixdepth, amount, utxo_filter_new, select_fn,
+                                 minconfs=minconfs)
+        ret_conv = {}
+        for utxo, data in ret.items():
+            addr = self.get_address_from_path(data['path'])
+            utxo_txt = binascii.hexlify(utxo[0]).decode('ascii') + ':' + str(utxo[1])
+            ret_conv[utxo_txt] = {'address': addr, 'value': data['value']}
+        return ret_conv
 
     def get_balance_by_mixdepth(self, verbose=True,
                                 include_disabled=False,

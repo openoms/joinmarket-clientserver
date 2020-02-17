@@ -2,7 +2,9 @@
 import sys
 import jmbitcoin as btc
 from jmbase import jmprint
-from jmclient import jm_single, get_p2pk_vbyte, get_p2sh_vbyte
+from jmclient import (jm_single, get_p2pk_vbyte, get_p2sh_vbyte,
+                      BTCEngine, TYPE_P2PKH, TYPE_P2SH_P2WPKH,
+                      BTC_P2PKH, BTC_P2SH_P2WPKH)
 from jmbase.support import EXIT_FAILURE
 
 
@@ -28,7 +30,8 @@ def get_utxo_info(upriv):
         jmprint("Failed to parse utxo information for utxo", "error")
         raise
     try:
-        hexpriv = btc.from_wif_privkey(priv, vbyte=get_p2pk_vbyte())
+        raw, keytype = BTCEngine.wif_to_privkey(priv)
+        assert keytype in [TYPE_P2PKH, TYPE_P2SH_P2WPKH]
     except:
         jmprint("failed to parse privkey, make sure it's WIF compressed format.", "error")
         raise
@@ -40,16 +43,21 @@ def validate_utxo_data(utxo_datas, retrieve=False, segwit=False):
     then use the blockchain instance to look up
     the utxo and check that its address field matches.
     If retrieve is True, return the set of utxos and their values.
+    If segwit is true, assumes a p2sh wrapped p2wpkh, i.e.
+    native segwit is NOT currently supported here. If segwit
+    is false, p2pkh is assumed.
     """
     results = []
     for u, priv in utxo_datas:
         jmprint('validating this utxo: ' + str(u), "info")
-        hexpriv = btc.from_wif_privkey(priv, vbyte=get_p2pk_vbyte())
-        if segwit:
-            addr = btc.pubkey_to_p2sh_p2wpkh_address(
-                btc.privkey_to_pubkey(hexpriv), get_p2sh_vbyte())
+        rawpriv, keytype = BTCEngine.wif_to_privkey(priv)
+        if keytype == TYPE_P2PKH:
+            walletcls = BTC_P2PKH
+        elif keytype == TYPE_P2SH_P2WPKH:
+            walletcls = BTC_P2SH_P2WPKH
         else:
-            addr = btc.privkey_to_address(hexpriv, magicbyte=get_p2pk_vbyte())
+            assert False, "invalid key type"
+        addr = walletcls.privkey_to_address(rawpriv)
         jmprint('claimed address: ' + addr, "info")
         res = jm_single().bc_interface.query_utxo_set([u])
         if len(res) != 1 or None in res:

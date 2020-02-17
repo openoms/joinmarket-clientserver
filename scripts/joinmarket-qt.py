@@ -76,7 +76,8 @@ from jmclient import load_program_config, get_network, update_persist_config,\
     get_tumble_log, restart_wait, tumbler_filter_orders_callback,\
     wallet_generate_recover_bip39, wallet_display, get_utxos_enabled_disabled,\
     NO_ROUNDING, get_max_cj_fee_values, get_default_max_absolute_fee, \
-    get_default_max_relative_fee, RetryableStorageError, add_base_options
+    get_default_max_relative_fee, RetryableStorageError, add_base_options, \
+    BTCEngine, BTC_P2SH_P2WPKH
 from qtsupport import ScheduleWizard, TumbleRestartWizard, config_tips,\
     config_types, QtHandler, XStream, Buttons, OkButton, CancelButton,\
     PasswordDialog, MyTreeWidget, JMQtMessageBox, BLUE_FG,\
@@ -1456,9 +1457,7 @@ class JMMainWindow(QMainWindow):
                 if done:
                     break
                 priv = self.wallet_service.get_key_from_addr(addr)
-                private_keys[addr] = btc.wif_compressed_privkey(
-                    priv,
-                    vbyte=get_p2pk_vbyte())
+                private_keys[addr] = BTCEngine.privkey_to_wif(priv)
                 self.computing_privkeys_signal.emit()
             self.show_privkeys_signal.emit()
 
@@ -1490,10 +1489,13 @@ class JMMainWindow(QMainWindow):
                                    privkeys_fn + '.json'), "wb") as f:
                 for addr, pk in private_keys.items():
                     #sanity check
-                    if not addr == btc.pubkey_to_p2sh_p2wpkh_address(
-                                    btc.privkey_to_pubkey(
-                                        btc.from_wif_privkey(pk, vbyte=get_p2pk_vbyte())
-                                    ), get_p2sh_vbyte()):
+                    rawpriv, keytype = BTCEngine.wif_to_privkey(pk)
+                    if not keytype == BTC_P2SH_P2WPKH:
+                        JMQtMessageBox(None, "Failed to create privkey export, "
+                                       "should be keytype p2sh-p2wpkh but is not.",
+                                       mbtype='crit')
+                        return
+                    if not addr == self.wallet_service._ENGINE.privkey_to_address(rawpriv):
                         JMQtMessageBox(None, "Failed to create privkey export -" +\
                                        " critical error in key parsing.",
                                        mbtype='crit')

@@ -11,7 +11,7 @@ import jmbitcoin as btc
 from jmbase import get_log, jmprint
 from jmclient import load_program_config, estimate_tx_fee, jm_single,\
     get_p2pk_vbyte, validate_address, get_utxo_info, add_base_options,\
-    validate_utxo_data, quit
+    validate_utxo_data, quit, BTCEngine, BTC_P2SH_P2WPKH
 
 
 log = get_log()
@@ -41,8 +41,9 @@ def sign(utxo, priv, destaddrs, segwit=True):
         outs.append({'address': addr, 'value': share})
     unsigned_tx = btc.mktx(ins, outs)
     amtforsign = amt if segwit else None
-    return btc.sign(unsigned_tx, 0, btc.from_wif_privkey(
-        priv, vbyte=get_p2pk_vbyte()), amount=amtforsign)
+    rawpriv, keytype = BTCEngine.wif_to_privkey(priv)
+    assert keytype == BTC_P2SH_P2WPKH
+    return btc.sign(unsigned_tx, 0, rawpriv, amount=amtforsign)
     
 def main():
     parser = OptionParser(

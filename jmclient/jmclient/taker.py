@@ -5,12 +5,10 @@ import base64
 import pprint
 import random
 from twisted.internet import reactor, task
-from binascii import hexlify, unhexlify
 
-from jmbitcoin import SerializationError, SerializationTruncationError
 import jmbitcoin as btc
 from jmclient.configure import jm_single, validate_address
-from jmbase.support import get_log
+from jmbase import get_log, hextobin, bintohex, hexbin
 from jmclient.support import (calc_cj_fee, weighted_order_choose, choose_orders,
                               choose_sweep_orders)
 from jmclient.wallet import estimate_tx_fee, compute_tx_locktime
@@ -238,7 +236,6 @@ class Taker(object):
         #Initialization has been successful. We must set the nonrespondants
         #now to keep track of what changed when we receive the utxo data
         self.nonrespondants = list(self.orderbook.keys())
-
         return (True, self.cjamount, commitment, revelation, self.orderbook)
 
     def filter_orderbook(self, orderbook, sweep=False):
@@ -344,6 +341,7 @@ class Taker(object):
         self.utxos = {None: list(self.input_utxos.keys())}
         return True
 
+    @hexbin
     def receive_utxos(self, ioauth_data):
         """Triggered when the daemon returns utxo data from
         makers who responded; this is the completion of phase 1
@@ -354,6 +352,7 @@ class Taker(object):
 
         #Temporary list used to aggregate all ioauth data that must be removed
         rejected_counterparties = []
+
         #Need to authorize against the btc pubkey first.
         for nick, nickdata in iteritems(ioauth_data):
             utxo_list, auth_pub, cj_addr, change_addr, btc_sig, maker_pk = nickdata
@@ -376,10 +375,9 @@ class Taker(object):
         self.maker_utxo_data = {}
 
         for nick, nickdata in iteritems(ioauth_data):
-            utxo_list, auth_pub, cj_addr, change_addr, btc_sig, maker_pk = nickdata
+            utxo_list, auth_pub, cj_addr, change_addr, _, _ = nickdata
+            utxo_data = jm_single().bc_interface.query_utxo_set(utxo_list)
             self.utxos[nick] = utxo_list
-            utxo_data = jm_single().bc_interface.query_utxo_set(self.utxos[
-                nick])
             if None in utxo_data:
                 jlog.warn(('ERROR outputs unconfirmed or already spent. '
                            'utxo_data={}').format(pprint.pformat(utxo_data)))
@@ -391,13 +389,12 @@ class Taker(object):
             #Extract the address fields from the utxos
             #Construct the Bitcoin address for the auth_pub field
             #Ensure that at least one address from utxos corresponds.
-            auth_pub_bin = unhexlify(auth_pub)
             for inp in utxo_data:
                 try:
                     if self.wallet_service.pubkey_has_script(
-                            auth_pub_bin, unhexlify(inp['script'])):
+                            auth_pub, inp['script']):
                         break
-                except EngineError:
+                except EngineError as e:
                     pass
             else:
                 jlog.warn("ERROR maker's (" + nick + ")"
@@ -500,81 +497,85 @@ class Taker(object):
         else:
             self.outputs.append({'address': self.my_change_addr,
                                  'value': my_change_value})
-        self.utxo_tx = [dict([('output', u)])
-                        for u in sum(self.utxos.values(), [])]
+        self.utxo_tx = [u for u in sum(self.utxos.values(), [])]
         self.outputs.append({'address': self.coinjoin_address(),
                              'value': self.cjamount})
-        tx = btc.make_shuffled_tx(self.utxo_tx, self.outputs, False)
-        jlog.info('obtained tx\n' + pprint.pformat(btc.deserialize(tx)))
+        self.latest_tx = btc.make_shuffled_tx(self.utxo_tx, self.outputs)
+        jlog.info('obtained tx\n' + bintohex(self.latest_tx.serialize()))
 
-        self.latest_tx = btc.deserialize(tx)
-        for index, ins in enumerate(self.latest_tx['ins']):
-            utxo = ins['outpoint']['hash'] + ':' + str(ins['outpoint']['index'])
+        for index, ins in enumerate(self.latest_tx.vin):
+            utxo = (ins.prevout.hash[::-1], ins.prevout.n)
             if utxo not in self.input_utxos.keys():
                 continue
             # placeholders required
-            ins['script'] = 'deadbeef'
+            ins.scriptSig = btc.CScript.fromhex("deadbeef")
         self.taker_info_callback("INFO", "Built tx, sending to counterparties.")
-        return (True, list(self.maker_utxo_data.keys()), tx)
+        return (True, list(self.maker_utxo_data.keys()),
+                bintohex(self.latest_tx.serialize()))
 
+    @hexbin
     def auth_counterparty(self, btc_sig, auth_pub, maker_pk):
         """Validate the counterpartys claim to own the btc
         address/pubkey that will be used for coinjoining
         with an ecdsa verification.
         """
         try:
-            if not btc.ecdsa_verify(maker_pk, btc_sig, auth_pub):
+            # maker pubkey as message is in hex format:
+            if not btc.ecdsa_verify(bintohex(maker_pk), btc_sig, auth_pub):
                 jlog.debug('signature didnt match pubkey and message')
                 return False
         except Exception as e:
-            jlog.info("Failed ecdsa verify for maker pubkey: " + str(maker_pk))
+            jlog.info("Failed ecdsa verify for maker pubkey: " + bintohex(maker_pk))
             jlog.info("Exception was: " + repr(e))
             return False
         return True
 
     def on_sig(self, nick, sigb64):
         """Processes transaction signatures from counterparties.
-        Returns True if all signatures received correctly, else
-        returns False
+        If all signatures received correctly, returns the result
+        of self.self_sign_and_push() (i.e. we complete the signing
+        and broadcast); else returns False (thus returns False for
+        all but last signature).
         """
         if self.aborted:
             return False
         if nick not in self.nonrespondants:
             jlog.debug(('add_signature => nick={} '
                        'not in nonrespondants {}').format(nick, self.nonrespondants))
-            return
-        sig = hexlify(base64.b64decode(sigb64)).decode('ascii')
+            return False
+        sig = base64.b64decode(sigb64)
         inserted_sig = False
-        txhex = btc.serialize(self.latest_tx)
 
         # batch retrieval of utxo data
         utxo = {}
         ctr = 0
-        for index, ins in enumerate(self.latest_tx['ins']):
-            utxo_for_checking = ins['outpoint']['hash'] + ':' + str(ins[
-                'outpoint']['index'])
-             #'deadbeef' markers mean our own input scripts are not ''
-            if (ins['script'] != ''):
+        for index, ins in enumerate(self.latest_tx.vin):
+            utxo_for_checking = (ins.prevout.hash[::-1], ins.prevout.n)
+             # 'deadbeef' markers mean our own input scripts are not queried
+            if ins.scriptSig != b"":
                 continue
             utxo[ctr] = [index, utxo_for_checking]
             ctr += 1
         utxo_data = jm_single().bc_interface.query_utxo_set([x[
             1] for x in utxo.values()])
-
         # insert signatures
         for i, u in iteritems(utxo):
             if utxo_data[i] is None:
                 continue
-            #Check if the sender serialize_scripted the scriptCode
-            #item into the sig message; if so, also pick up the amount
-            #from the utxo data retrieved from the blockchain to verify
-            #the segwit-style signature. Note that this allows a mixed
-            #SW/non-SW transaction as each utxo is interpreted separately.
-            sig_deserialized = btc.deserialize_script(sig)
-            #verify_tx_input will not even parse the script if it has integers or None,
-            #so abort in case we were given a junk sig:
-            if not all([not isinstance(x, int) and x for x in sig_deserialized]):
-                jlog.warn("Junk signature: " + str(sig_deserialized) + \
+            # Check if the sender included the scriptCode in the sig message;
+            # if so, also pick up the amount from the utxo data retrieved
+            # from the blockchain to verify the segwit-style signature.
+            # Note that this allows a mixed SW/non-SW transaction as each utxo
+            # is interpreted separately.
+            try:
+                sig_deserialized = [a for a in iter(btc.CScript(sig))]
+            except Exception as e:
+                jlog.debug("Failed to parse junk sig message, ignoring.")
+                break
+            # abort in case we were given a junk sig (note this previously had
+            # to check to avoid crashes in verify_tx_input, no longer (Feb 2020)):
+            if not all([x for x in sig_deserialized]):
+                jlog.debug("Junk signature: " + str(sig_deserialized) + \
                           ", not attempting to verify")
                 break
             if len(sig_deserialized) == 2:
@@ -583,44 +584,48 @@ class Taker(object):
             elif len(sig_deserialized) == 3:
                 ver_sig, ver_pub, scriptCode =  sig_deserialized
             else:
-                jlog.debug("Invalid signature message - more than 3 items")
+                jlog.debug("Invalid signature message - not 2 or 3 items")
                 break
-            ver_amt = utxo_data[i]['value'] if scriptCode else None
-            sig_good = btc.verify_tx_input(txhex, u[0], utxo_data[i]['script'],
-                            ver_sig, ver_pub, scriptCode=scriptCode, amount=ver_amt)
 
-            if ver_amt is not None and not sig_good:
-                # Special case to deal with legacy bots 0.5.0 or lower:
-                # the third field in the sigmessage was originally *not* the
-                # scriptCode, but the contents of tx['ins'][index]['script'],
-                # i.e. the witness program 0014... ; for this we can verify
-                # implicitly, as verify_tx_input used to, by reconstructing
-                # from the public key. For these cases, we can *assume* that
-                # the input is of type p2sh-p2wpkh; we call the jmbitcoin method
-                # directly, as we cannot assume that *our* wallet handles this.
-                scriptCode = hexlify(btc.pubkey_to_p2pkh_script(
-                    ver_pub, True)).decode('ascii')
-                sig_good = btc.verify_tx_input(txhex, u[0], utxo_data[i]['script'],
-                        ver_sig, ver_pub, scriptCode=scriptCode, amount=ver_amt)
+            ver_amt = utxo_data[i]['value'] if scriptCode else None
+            witness = btc.CScriptWitness(
+                [ver_sig, ver_pub]) if scriptCode else None
+
+            # don't attempt to parse `pub` as pubkey unless it's valid.
+            if scriptCode:
+                try:
+                    s = btc.pubkey_to_p2wpkh_script(ver_pub)
+                except:
+                    jlog.debug("Junk signature message, invalid pubkey, ignoring.")
+                    break
+            scriptSig = btc.CScript([ver_sig, ver_pub]) if not scriptCode else btc.CScript([s])
+
+            # Pre-Feb 2020, we used the third field scriptCode differently in
+            # pre- and post-0.5.0; now the scriptCode is implicit (i.e. calculated
+            # by underlying library, so that exceptional case is covered.
+            sig_good = btc.verify_tx_input(self.latest_tx, u[0], scriptSig,
+                    btc.CScript(utxo_data[i]['script']), amount=ver_amt, witness=witness)
+
+            # verification for the native case is functionally identical but
+            # adds another flag; so we can allow it here:
+            if not sig_good:
+                sig_good = btc.verify_tx_input(self.latest_tx, u[0], scriptSig,
+                                    btc.CScript(utxo_data[i]['script']), amount=ver_amt,
+                                    witness=witness, native=True)
+                # if passes, below code executes, and we should change for native:
+                scriptSig = btc.CScript([b""])
 
             if sig_good:
                 jlog.debug('found good sig at index=%d' % (u[0]))
+
+                # Note that, due to the complexity of handling multisig or other
+                # arbitrary script (considering sending multiple signatures OTW),
+                # there is an assumption of p2sh-p2wpkh or p2wpkh, for the segwit
+                # case.
+                self.latest_tx.vin[u[0]].scriptSig = scriptSig
                 if ver_amt:
-                    # Note that, due to the complexity of handling multisig or other
-                    # arbitrary script (considering sending multiple signatures OTW),
-                    # there is an assumption of p2sh-p2wpkh or p2wpkh, for the segwit
-                    # case.
-                    self.latest_tx["ins"][u[0]]["txinwitness"] = [ver_sig, ver_pub]
-                    if btc.is_segwit_native_script(utxo_data[i]['script']):
-                        scriptSig = ""
-                    else:
-                        scriptSig = btc.serialize_script_unit(
-                            btc.pubkey_to_p2wpkh_script(ver_pub))
-                    self.latest_tx["ins"][u[0]]["script"] = scriptSig
-                else:
-                    # Non segwit (as per above comments) is limited only to single key,
-                    # p2pkh case.
-                    self.latest_tx["ins"][u[0]]["script"] = sig
+                    self.latest_tx.wit.vtxinwit[u[0]] = btc.CTxInWitness(
+                    btc.CScriptWitness(witness))
                 inserted_sig = True
 
                 # check if maker has sent everything possible
@@ -643,8 +648,8 @@ class Taker(object):
             # other guy sent a failed signature
 
         tx_signed = True
-        for ins in self.latest_tx['ins']:
-            if ins['script'] == '':
+        for ins in self.latest_tx.vin:
+            if ins.scriptSig == b"":
                 tx_signed = False
         if not tx_signed:
             return False
@@ -667,7 +672,7 @@ class Taker(object):
 
         def filter_by_coin_age_amt(utxos, age, amt):
             results = jm_single().bc_interface.query_utxo_set(utxos,
-                                                              includeconf=True)
+                                                    includeconf=True)
             newresults = []
             too_old = []
             too_small = []
@@ -695,7 +700,7 @@ class Taker(object):
                                                                    age, amt)
             new_utxos_dict = {k: v for k, v in utxos.items() if k in new_utxos}
             for k, v in iteritems(new_utxos_dict):
-                addr = v['address']
+                addr = self.wallet_service.script_to_addr(v["script"])
                 priv = self.wallet_service.get_key_from_addr(addr)
                 if priv:  #can be null from create-unsigned
                     priv_utxo_pairs.append((priv, k))
@@ -723,7 +728,7 @@ class Taker(object):
             #in the transaction, about to be consumed, rather than use
             #random utxos that will persist after. At this step we also
             #allow use of external utxos in the json file.
-            if any(self.wallet_service.get_utxos_by_mixdepth(hexfmt=False).values()):
+            if any(self.wallet_service.get_utxos_by_mixdepth().values()):
                 utxos = {}
                 for mdutxo in self.wallet_service.get_utxos_by_mixdepth().values():
                     utxos.update(mdutxo)
@@ -739,13 +744,9 @@ class Taker(object):
                 ext_valid = None
             podle_data = generate_podle(priv_utxo_pairs, tries, ext_valid)
         if podle_data:
-            jlog.debug("Generated PoDLE: " + pprint.pformat(podle_data))
-            revelation = PoDLE(u=podle_data['utxo'],
-                                   P=podle_data['P'],
-                                   P2=podle_data['P2'],
-                                   s=podle_data['sig'],
-                                   e=podle_data['e']).serialize_revelation()
-            return (commit_type_byte + podle_data["commit"], revelation,
+            jlog.debug("Generated PoDLE: " + repr(podle_data))
+            return (commit_type_byte + bintohex(podle_data.commitment),
+                    podle_data.serialize_revelation(),
                     "Commitment sourced OK")
         else:
             errmsgheader, errmsg = generate_podle_error_string(priv_utxo_pairs,
@@ -771,25 +772,26 @@ class Taker(object):
     def self_sign(self):
         # now sign it ourselves
         our_inputs = {}
-        for index, ins in enumerate(self.latest_tx['ins']):
-            utxo = ins['outpoint']['hash'] + ':' + str(ins['outpoint']['index'])
+        for index, ins in enumerate(self.latest_tx.vin):
+            utxo = (ins.prevout.hash[::-1], ins.prevout.n)
             if utxo not in self.input_utxos.keys():
                 continue
-            script = self.wallet_service.addr_to_script(self.input_utxos[utxo]['address'])
+            script = self.input_utxos[utxo]["script"]
             amount = self.input_utxos[utxo]['value']
             our_inputs[index] = (script, amount)
-        self.latest_tx = self.wallet_service.sign_tx(self.latest_tx, our_inputs)
+        success, msg = self.wallet_service.sign_tx(self.latest_tx, our_inputs)
+        if not success:
+            jlog.error("Failed to sign transaction: " + msg)
 
     def push(self):
-        tx = btc.serialize(self.latest_tx)
-        jlog.debug('\n' + tx)
-        self.txid = btc.txhash(tx)
+        jlog.debug('\n' + bintohex(self.latest_tx.serialize()))
+        self.txid = bintohex(self.latest_tx.GetTxid()[::-1])
         jlog.info('txid = ' + self.txid)
         #If we are sending to a bech32 address, in case of sweep, will
         #need to use that bech32 for address import, which requires
         #converting to script (Core does not allow import of bech32)
         if self.my_cj_addr.lower()[:2] in ['bc', 'tb']:
-            notify_addr = btc.address_to_script(self.my_cj_addr)
+            notify_addr = btc.CCoinAddress.to_scriptPubKey(self.my_cj_addr)
         else:
             notify_addr = self.my_cj_addr
         #add the callbacks *before* pushing to ensure triggering;
@@ -810,7 +812,7 @@ class Taker(object):
         tx_broadcast = jm_single().config.get('POLICY', 'tx_broadcast')
         nick_to_use = None
         if tx_broadcast == 'self':
-            pushed = jm_single().bc_interface.pushtx(tx)
+            pushed = jm_single().bc_interface.pushtx(self.latest_tx.serialize())
         elif tx_broadcast in ['random-peer', 'not-self']:
             n = len(self.maker_utxo_data)
             if tx_broadcast == 'random-peer':
@@ -818,14 +820,14 @@ class Taker(object):
             else:
                 i = random.randrange(n)
             if i == n:
-                pushed = jm_single().bc_interface.pushtx(tx)
+                pushed = jm_single().bc_interface.pushtx(self.latest_tx.serialize())
             else:
                 nick_to_use = list(self.maker_utxo_data.keys())[i]
                 pushed = True
         else:
             jlog.info("Only self, random-peer and not-self broadcast "
                       "methods supported. Reverting to self-broadcast.")
-            pushed = jm_single().bc_interface.pushtx(tx)
+            pushed = jm_single().bc_interface.pushtx(self.latest_tx.serialize())
         if not pushed:
             self.on_finished_callback(False, fromtx=True)
         else:
@@ -1148,7 +1150,6 @@ class P2EPTaker(Taker):
                 try:
                     ver_sig, ver_pub = tx["ins"][idx]["txinwitness"]
                 except Exception as e:
-                    print("Segwit error: ", repr(e))
                     return (False, "Segwit input not of expected type, "
                             "either p2sh-p2wpkh or p2wpkh")
                 # note that the scriptCode is the same whether nested or not

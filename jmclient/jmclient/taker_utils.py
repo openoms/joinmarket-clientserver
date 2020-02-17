@@ -10,8 +10,7 @@ from .configure import jm_single, validate_address
 from .schedule import human_readable_schedule_entry, tweak_tumble_schedule,\
     schedule_to_text
 from .wallet import BaseWallet, estimate_tx_fee, compute_tx_locktime
-from jmbitcoin import deserialize, make_shuffled_tx, serialize, txhash,\
-    amount_to_str
+from jmbitcoin import make_shuffled_tx, amount_to_str
 from jmbase.support import EXIT_SUCCESS
 log = get_log()
 
