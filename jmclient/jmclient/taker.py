@@ -791,7 +791,7 @@ class Taker(object):
         #need to use that bech32 for address import, which requires
         #converting to script (Core does not allow import of bech32)
         if self.my_cj_addr.lower()[:2] in ['bc', 'tb']:
-            notify_addr = btc.CCoinAddress.to_scriptPubKey(self.my_cj_addr)
+            notify_addr = btc.CCoinAddress(self.my_cj_addr).to_scriptPubKey()
         else:
             notify_addr = self.my_cj_addr
         #add the callbacks *before* pushing to ensure triggering;
@@ -930,12 +930,12 @@ class P2EPTaker(Taker):
         # For the p2ep taker, the variable 'my_cj_addr' is the destination:
         self.my_cj_addr = si[3]
         if isinstance(self.cjamount, float):
-            raise JMTakerError("P2EP coinjoin must use amount in satoshis")
+            raise JMTakerError("Payjoin must use amount in satoshis")
         if self.cjamount == 0:
             # Note that we don't allow sweep, currently, since the coin
             # choosing algo would not apply in that case (we'd have to rewrite
             # prepare_my_bitcoin_data for that case).
-            raise JMTakerError("P2EP coinjoin does not currently support sweep")
+            raise JMTakerError("Payjoin does not currently support sweep")
 
         # Next we prepare our coins with the inherited method
         # for this purpose; for this we must set the
@@ -1006,27 +1006,27 @@ class P2EPTaker(Taker):
         if self.my_change_addr is not None:
             self.outputs.append({'address': self.my_change_addr,
                                  'value': my_change_value})
-        # As for JM coinjoins, the `None` key is used for our own inputs
-        # to the transaction; this preparatory version contains only those.
-        tx = btc.make_shuffled_tx(self.utxos[None], self.outputs,
-                              False, 2, compute_tx_locktime())
-        jlog.info('Created proposed fallback tx\n' + pprint.pformat(
-            btc.deserialize(tx)))
+        # Oour own inputs to the transaction; this preparatory version
+        # contains only those.
+        tx = btc.make_shuffled_tx(self.input_utxos, self.outputs,
+                              version=2, locktime=compute_tx_locktime())
+        jlog.info('Created proposed fallback tx\n' + pprint.pformat(str(tx)))
         # We now sign as a courtesy, because if we disappear the recipient
         # can still claim his coins with this.
         # sign our inputs before transfer
         our_inputs = {}
-        dtx = btc.deserialize(tx)
-        for index, ins in enumerate(dtx['ins']):
-            utxo = ins['outpoint']['hash'] + ':' + str(ins['outpoint']['index'])
-            script = self.wallet_service.addr_to_script(self.input_utxos[utxo]['address'])
-            amount = self.input_utxos[utxo]['value']
-            our_inputs[index] = (script, amount)
-        self.signed_noncj_tx = btc.serialize(self.wallet_service.sign_tx(dtx, our_inputs))
+        for index, ins in enumerate(tx.vin):
+            utxo = (ins.prevout.hash[::-1], ins.prevout.n)
+            our_inputs[index] = (self.input_utxos[utxo]["script"],
+                                 self.input_utxos[utxo]['value'])
+        success, msg = self.wallet_service.sign_tx(tx, our_inputs)
+        if not success:
+            jlog.error("Failed to create backup transaction; error: " + msg)
         self.taker_info_callback("INFO", "Built tx proposal, sending to receiver.")
-        return (True, [self.p2ep_receiver_nick], self.signed_noncj_tx)
+        return (True, [self.p2ep_receiver_nick], bintohex(tx.serialize()))
 
-    def on_tx_received(self, nick, txhex):
+    @hexbin
+    def on_tx_received(self, nick, txser):
         """ Here the taker (payer) retrieves a version of the
         transaction from the maker (receiver) which should have
         the following properties:
@@ -1043,12 +1043,14 @@ class P2EPTaker(Taker):
         and then broadcast (TODO broadcast delay or don't broadcast).
         """
         try:
-            tx = btc.deserialize(txhex)
-        except (IndexError, SerializationError, SerializationTruncationError) as e:
+            tx = btc.CMutableTransaction.deserialize(txser)
+        except Exception as e:
             return (False, "malformed txhex. " + repr(e))
-        jlog.info("Obtained tx from receiver:\n" + pprint.pformat(tx))
-        cjaddr_script = btc.address_to_script(self.my_cj_addr)
-        changeaddr_script = btc.address_to_script(self.my_change_addr)
+        jlog.info("Obtained tx from receiver:\n" + pprint.pformat(str(tx)))
+        cjaddr_script = btc.CCoinAddress(
+            self.my_cj_addr).to_scriptPubKey()
+        changeaddr_script = btc.CCoinAddress(
+            self.my_change_addr).to_scriptPubKey()
 
         # We ensure that the coinjoin address and our expected change
         # address are still in the outputs, once (with the caveat that
@@ -1056,19 +1058,19 @@ class P2EPTaker(Taker):
         # of dust change, which we assess after).
         times_seen_cj_addr = 0
         times_seen_change_addr = 0
-        for outs in tx['outs']:
-            if outs['script'] == cjaddr_script:
+        for outs in tx.vout:
+            if outs.scriptPubKey == cjaddr_script:
                 times_seen_cj_addr += 1
-                new_cj_amount = outs['value']
+                new_cj_amount = outs.nValue
                 if new_cj_amount < self.cjamount:
                     # This is a violation of protocol;
                     # receiver must be providing extra bitcoin
                     # as input, so his receiving amount should have increased.
                     return (False,
                     'Wrong cj_amount. I expect at least' + str(self.cjamount))
-            if outs['script'] == changeaddr_script:
+            if outs.scriptPubKey == changeaddr_script:
                 times_seen_change_addr += 1
-                new_change_amount = outs['value']
+                new_change_amount = outs.nValue
         if times_seen_cj_addr != 1:
             fmt = ('cj addr not in tx outputs once, #cjaddr={}').format
             return (False, (fmt(times_seen_cj_addr)))
@@ -1079,8 +1081,7 @@ class P2EPTaker(Taker):
             new_change_amount = 0
 
         # Check that our inputs are present.
-        tx_utxo_set = set(ins['outpoint']['hash'] + ':' + str(
-            ins['outpoint']['index']) for ins in tx['ins'])
+        tx_utxo_set = set((ins.prevout.hash[::-1], ins.prevout.n) for ins in tx.vin)
         if not tx_utxo_set.issuperset(set(self.utxos[None])):
             return (False, "my utxos are not contained")
         # Check that the sequence numbers of all inputs are unaltered
@@ -1089,10 +1090,10 @@ class P2EPTaker(Taker):
         # Note that this is hacky and is most elegantly addressed by
         # use of PSBT (although any object encapsulation of tx input
         # would serve the same purpose).
-        if tx["locktime"] == 0:
+        if tx.nLockTime == 0:
             return (False, "Invalid PayJoin v0 transaction: locktime 0")
-        for i in tx["ins"]:
-            if i["sequence"] != 0xffffffff - 1:
+        for i in tx.vin:
+            if i.nSequence != 0xffffffff - 1:
                 return (False, "Invalid PayJoin v0 transaction: "+\
                         "sequence is not 0xffffffff -1")
 
@@ -1101,7 +1102,7 @@ class P2EPTaker(Taker):
         # not) of PayJoin to sweep utxos at no cost.
         # (TODO This is very kludgy, more sophisticated approach
         # should be used in future):
-        if len(tx["ins"]) - len (self.utxos[None]) > 5:
+        if len(tx.vin) - len (self.utxos[None]) > 5:
             return (False,
                     "proposed tx has more than 5 inputs from "
                     "the recipient, which is too expensive.")
@@ -1124,9 +1125,8 @@ class P2EPTaker(Taker):
         # checking input validity and transaction balance.
         retrieve_utxos = {}
         ctr = 0
-        for index, ins in enumerate(tx['ins']):
-            utxo_for_checking = ins['outpoint']['hash'] + ':' + str(
-                ins['outpoint']['index'])
+        for index, ins in enumerate(tx.vin):
+            utxo_for_checking = (ins.prevout.hash[::-1], ins.prevout.n)
             if utxo_for_checking in self.utxos[None]:
                 continue
             retrieve_utxos[ctr] = [index, utxo_for_checking]
@@ -1142,31 +1142,11 @@ class P2EPTaker(Taker):
             if utxo_data[i] is None:
                 return (False, "Proposed transaction contains invalid utxos")
             total_receiver_input += utxo_data[i]["value"]
-            scriptCode = None
-            ver_amt = None
             idx = retrieve_utxos[i][0]
-            if "txinwitness" in tx["ins"][idx]:
-                ver_amt = utxo_data[i]["value"]
-                try:
-                    ver_sig, ver_pub = tx["ins"][idx]["txinwitness"]
-                except Exception as e:
-                    return (False, "Segwit input not of expected type, "
-                            "either p2sh-p2wpkh or p2wpkh")
-                # note that the scriptCode is the same whether nested or not
-                # also note that the scriptCode has to be inferred if we are
-                # only given a transaction serialization.
-                scriptCode = "76a914" + btc.hash160(unhexlify(ver_pub)) + "88ac"
-            else:
-                scriptSig = btc.deserialize_script(tx["ins"][idx]["script"])
-                if len(scriptSig) != 2:
-                    return (False,
-                    "Proposed transaction contains unsupported input type")
-                ver_sig, ver_pub = scriptSig
-            if not btc.verify_tx_input(txhex, idx,
-                                       utxo_data[i]['script'],
-                                       ver_sig, ver_pub,
-                                       scriptCode=scriptCode,
-                                       amount=ver_amt):
+            if not btc.verify_tx_input(tx, idx, tx.vin[idx].scriptSig,
+                                       btc.CScript(utxo_data[i]['script']),
+                                       amount=utxo_data[i]["value"],
+                                       witness=tx.wit.vtxinwit[idx].scriptWitness):
                 return (False,
                         "Proposed transaction is not correctly signed.")
         payment = new_cj_amount - total_receiver_input
@@ -1186,7 +1166,7 @@ class P2EPTaker(Taker):
         # our fee estimator. Its return value will be governed by our own fee settings
         # in joinmarket.cfg; allow either (a) automatic agreement for any value within
         # a range of 0.3 to 3x this figure, or (b) user to agree on prompt.
-        fee_est = estimate_tx_fee(len(tx['ins']), len(tx['outs']),
+        fee_est = estimate_tx_fee(len(tx.vin), len(tx.vout),
                                   txtype=self.wallet_service.get_txtype())
         fee_ok = False
         if btc_fee > 0.3 * fee_est and btc_fee < 3 * fee_est:

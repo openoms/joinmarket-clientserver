@@ -395,7 +395,8 @@ class P2EPMaker(Maker):
         # will not be reached except in testing
         self.on_tx_unconfirmed(txd, txid)
 
-    def on_tx_received(self, nick, txhex):
+    @hexbin
+    def on_tx_received(self, nick, txser):
         """ Called when the sender-counterparty has sent a transaction proposal.
         1. First we check for the expected destination and amount (this is
            sufficient to identify our cp, as this info was presumably passed
@@ -421,29 +422,30 @@ class P2EPMaker(Maker):
            we broadcast the non-coinjoin fallback tx instead.
         """
         try:
-            tx = btc.deserialize(txhex)
-        except (IndexError, SerializationError, SerializationTruncationError) as e:
+            tx = btc.CMutableTransaction.deserialize(txser)
+        except Exception as e:
             return (False, 'malformed txhex. ' + repr(e))
         self.user_info('obtained proposed fallback (non-coinjoin) ' +\
-                       'transaction from sender:\n' + pprint.pformat(tx))
+                       'transaction from sender:\n' + str(tx))
 
-        if len(tx["outs"]) != 2:
+        if len(tx.vout) != 2:
             return (False, "Transaction has more than 2 outputs; not supported.")
         dest_found = False
         destination_index = -1
         change_index = -1
         proposed_change_value = 0
-        for index, out in enumerate(tx["outs"]):
-            if out["script"] == btc.address_to_script(self.destination_addr):
+        for index, out in enumerate(tx.vout):
+            if out.scriptPubKey == btc.CCoinAddress(
+                self.destination_addr).to_scriptPubKey():
                 # we found the expected destination; is the amount correct?
-                if not out["value"] == self.receiving_amount:
+                if not out.nValue == self.receiving_amount:
                     return (False, "Wrong payout value in proposal from sender.")
                 dest_found = True
                 destination_index = index
             else:
                 change_found = True
-                proposed_change_out = out["script"]
-                proposed_change_value = out["value"]
+                proposed_change_out = out.scriptPubKey
+                proposed_change_value = out.nValue
                 change_index = index
 
         if not dest_found:
@@ -453,9 +455,8 @@ class P2EPMaker(Maker):
         # batch retrieval of utxo data
         utxo = {}
         ctr = 0
-        for index, ins in enumerate(tx['ins']):
-            utxo_for_checking = ins['outpoint']['hash'] + ':' + str(ins[
-                'outpoint']['index'])
+        for index, ins in enumerate(tx.vin):
+            utxo_for_checking = (ins.prevout.hash[::-1], ins.prevout.n)
             utxo[ctr] = [index, utxo_for_checking]
             ctr += 1
 
@@ -474,7 +475,7 @@ class P2EPMaker(Maker):
         btc_fee = total_sender_input - self.receiving_amount - proposed_change_value
         self.user_info("Network transaction fee of fallback tx is: " + str(
             btc_fee) + " satoshis.")
-        fee_est = estimate_tx_fee(len(tx['ins']), len(tx['outs']),
+        fee_est = estimate_tx_fee(len(tx.vin), len(tx.vout),
                                   txtype=self.wallet_service.get_txtype())
         fee_ok = False
         if btc_fee > 0.3 * fee_est and btc_fee < 3 * fee_est:
@@ -491,51 +492,28 @@ class P2EPMaker(Maker):
         # It has the advantage of (a) being simpler and (b) allowing for any
         # non standard coins.
         #
-        #res = jm_single().bc_interface.rpc('testmempoolaccept', [txhex])
+        #res = jm_single().bc_interface.rpc('testmempoolaccept', [txser])
         #print("Got this result from rpc call: ", res)
         #if not res["accepted"]:
         #    return (False, "Proposed transaction was rejected from mempool.")
 
-        # Manual verification of the transaction signatures. Passing this
-        # test does imply that the transaction is valid (unless there is
-        # a double spend during the process), but is restricted to standard
-        # types: p2pkh, p2wpkh, p2sh-p2wpkh only. Double spend is not counted
-        # as a risk as this is a payment.
+        # Manual verification of the transaction signatures.
+        # TODO handle native segwit properly
         for i, u in iteritems(utxo):
-            if "txinwitness" in tx["ins"][u[0]]:
-                ver_amt = utxo_data[i]["value"]
-                try:
-                    ver_sig, ver_pub = tx["ins"][u[0]]["txinwitness"]
-                except Exception as e:
-                    self.user_info("Segwit error: " + repr(e))
-                    return (False, "Segwit input not of expected type, "
-                            "either p2sh-p2wpkh or p2wpkh")
-                # note that the scriptCode is the same whether nested or not
-                # also note that the scriptCode has to be inferred if we are
-                # only given a transaction serialization.
-                scriptCode = "76a914" + btc.hash160(unhexlify(ver_pub)) + "88ac"
-            else:
-                scriptCode = None
-                ver_amt = None
-                scriptSig = btc.deserialize_script(tx["ins"][u[0]]["script"])
-                if len(scriptSig) != 2:
-                    return (False,
-                        "Proposed transaction contains unsupported input type")
-                ver_sig, ver_pub = scriptSig
-            if not btc.verify_tx_input(txhex, u[0],
-                                           utxo_data[i]['script'],
-                                           ver_sig, ver_pub,
-                                           scriptCode=scriptCode,
-                                           amount=ver_amt):
+            if not btc.verify_tx_input(tx, i,
+                                       tx.vin[i].scriptSig,
+                                       btc.CScript(utxo_data[i]["script"]),
+                                       amount=utxo_data[i]["value"],
+                                       witness=tx.wit.vtxinwit[i].scriptWitness):
                 return (False, "Proposed transaction is not correctly signed.")
 
         # At this point we are satisfied with the proposal. Record the fallback
         # in case the sender disappears and the payjoin tx doesn't happen:
         self.user_info("We'll use this serialized transaction to broadcast if your"
                   " counterparty fails to broadcast the payjoin version:")
-        self.user_info(txhex)
+        self.user_info(bintohex(txser))
         # Keep a local copy for broadcast fallback:
-        self.fallback_tx = txhex
+        self.fallback_tx = tx
 
         # Now we add our own inputs:
         # See the gist comment here:
@@ -561,7 +539,7 @@ class P2EPMaker(Maker):
             self.user_info("Choosing one coin at random")
             try:
                 my_utxos = self.wallet_service.select_utxos(
-                    self.mixdepth,  jm_single().DUST_THRESHOLD,
+                    self.mixdepth, jm_single().DUST_THRESHOLD,
                     select_fn=select_one_utxo)
             except:
                 return self.no_coins_fallback()
@@ -569,7 +547,7 @@ class P2EPMaker(Maker):
         else:
             # get an approximate required amount assuming 4 inputs, which is
             # fairly conservative (but guess by necessity).
-            fee_for_select = estimate_tx_fee(len(tx['ins']) + 4, 2,
+            fee_for_select = estimate_tx_fee(len(tx.vin) + 4, 2,
                                              txtype=self.wallet_service.get_txtype())
             approx_sum = max_sender_amt - self.receiving_amount + fee_for_select
             try:
@@ -595,7 +573,7 @@ class P2EPMaker(Maker):
         # adjust the output amount at the destination based on our contribution
         new_destination_amount = self.receiving_amount + my_total_in
         # estimate the required fee for the new version of the transaction
-        total_ins = len(tx["ins"]) + len(my_utxos.keys())
+        total_ins = len(tx.vin) + len(my_utxos.keys())
         est_fee = estimate_tx_fee(total_ins, 2, txtype=self.wallet_service.get_txtype())
         self.user_info("We estimated a fee of: " + str(est_fee))
         new_change_amount = total_sender_input + my_total_in - \
@@ -607,25 +585,27 @@ class P2EPMaker(Maker):
         new_outs = [{"address": self.destination_addr,
                      "value": new_destination_amount}]
         if new_change_amount >= jm_single().BITCOIN_DUST_THRESHOLD:
-            new_outs.append({"script": proposed_change_out,
-                     "value": new_change_amount})
+            new_outs.append({"address": str(btc.CCoinAddress.from_scriptPubKey(
+                proposed_change_out)), "value": new_change_amount})
         new_ins = [x[1] for x in utxo.values()]
         new_ins.extend(my_utxos.keys())
-        new_tx = btc.make_shuffled_tx(new_ins, new_outs, False, 2, compute_tx_locktime())
-        new_tx_deser = btc.deserialize(new_tx)
+        new_tx = btc.make_shuffled_tx(new_ins, new_outs, 2, compute_tx_locktime())
+
 
         # sign our inputs before transfer
         our_inputs = {}
-        for index, ins in enumerate(new_tx_deser['ins']):
-            utxo = ins['outpoint']['hash'] + ':' + str(ins['outpoint']['index'])
+        for index, ins in enumerate(new_tx.vin):
+            utxo = (ins.prevout.hash[::-1], ins.prevout.n)
             if utxo not in my_utxos:
                 continue
-            script = self.wallet_service.addr_to_script(my_utxos[utxo]['address'])
-            amount = my_utxos[utxo]['value']
+            script = my_utxos[utxo]["script"]
+            amount = my_utxos[utxo]["value"]
             our_inputs[index] = (script, amount)
 
-        txs = self.wallet_service.sign_tx(btc.deserialize(new_tx), our_inputs)
-        txinfo = tuple((x["script"], x["value"]) for x in txs["outs"])
+        success, msg = self.wallet_service.sign_tx(new_tx, our_inputs)
+        if not success:
+            return (False, "Failed to sign new transaction, error: " + msg)
+        txinfo = tuple((x.scriptPubKey, x.nValue) for x in new_tx.vout)
         self.wallet_service.register_callbacks([self.on_tx_unconfirmed], txinfo, "unconfirmed")
         self.wallet_service.register_callbacks([self.on_tx_confirmed], txinfo, "confirmed")
         # The blockchain interface just abandons monitoring if the transaction
@@ -633,7 +613,7 @@ class P2EPMaker(Maker):
         # action in this case, so we add an additional callback to the reactor:
         reactor.callLater(jm_single().config.getint("TIMEOUT",
                             "unconfirm_timeout_sec"), self.broadcast_fallback)
-        return (True, nick, btc.serialize(txs))
+        return (True, nick, bintohex(new_tx.serialize()))
 
     def no_coins_fallback(self):
         """ Broadcast, optionally, the fallback non-coinjoin transaction
@@ -649,8 +629,8 @@ class P2EPMaker(Maker):
 
     def broadcast_fallback(self):
         self.user_info("Broadcasting non-coinjoin fallback transaction.")
-        txid = btc.txhash(self.fallback_tx)
-        success = jm_single().bc_interface.pushtx(self.fallback_tx)
+        txid = self.fallback_tx.GetTxid()[::-1]
+        success = jm_single().bc_interface.pushtx(self.fallback_tx.serialize())
         if not success:
             self.user_info("ERROR: the fallback transaction did not broadcast. "
                       "The payment has NOT been made.")
