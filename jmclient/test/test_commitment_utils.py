@@ -31,7 +31,7 @@ def test_get_utxo_info():
     with pytest.raises(Exception) as e_info:
         u, priv = get_utxo_info(fakeutxo + privkey)
     #invalid index
-    fu2 = "ab"*32 + ":00004"
+    fu2 = "ab"*32 + ":-1"
     with pytest.raises(Exception) as e_info:
         u, priv = get_utxo_info(fu2 + "," + privkey)
     #invalid privkey

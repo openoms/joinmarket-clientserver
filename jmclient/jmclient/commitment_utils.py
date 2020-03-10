@@ -5,7 +5,7 @@ from jmbase import jmprint
 from jmclient import (jm_single, get_p2pk_vbyte, get_p2sh_vbyte,
                       BTCEngine, TYPE_P2PKH, TYPE_P2SH_P2WPKH,
                       BTC_P2PKH, BTC_P2SH_P2WPKH)
-from jmbase.support import EXIT_FAILURE
+from jmbase.support import EXIT_FAILURE, utxostr_to_utxo
 
 
 def quit(parser, errmsg): #pragma: no cover
@@ -20,18 +20,16 @@ def get_utxo_info(upriv):
         u, priv = upriv.split(',')
         u = u.strip()
         priv = priv.strip()
-        txid, n = u.split(':')
-        assert len(txid)==64
-        assert len(n) in range(1, 4)
-        n = int(n)
-        assert n in range(256)
+        success, utxo = utxostr_to_utxo(u)
+        assert success, utxo
     except:
         #not sending data to stdout in case privkey info
         jmprint("Failed to parse utxo information for utxo", "error")
         raise
     try:
-        raw, keytype = BTCEngine.wif_to_privkey(priv)
-        assert keytype in [TYPE_P2PKH, TYPE_P2SH_P2WPKH]
+        # see note below for why keytype is ignored, and note that
+        # this calls read_privkey to validate.
+        raw, _ = BTCEngine.wif_to_privkey(priv)
     except:
         jmprint("failed to parse privkey, make sure it's WIF compressed format.", "error")
         raise
@@ -50,14 +48,13 @@ def validate_utxo_data(utxo_datas, retrieve=False, segwit=False):
     results = []
     for u, priv in utxo_datas:
         jmprint('validating this utxo: ' + str(u), "info")
-        rawpriv, keytype = BTCEngine.wif_to_privkey(priv)
-        if keytype == TYPE_P2PKH:
-            walletcls = BTC_P2PKH
-        elif keytype == TYPE_P2SH_P2WPKH:
-            walletcls = BTC_P2SH_P2WPKH
-        else:
-            assert False, "invalid key type"
-        addr = walletcls.privkey_to_address(rawpriv)
+        # as noted in `ImportWalletMixin` code comments, there is not
+        # yet a functional auto-detection of key type from WIF, so the
+        # second argument is ignored; we assume p2sh-p2wpkh if segwit,
+        # else we assume p2pkh.
+        engine = BTC_P2SH_P2WPKH if segwit else BTC_P2PKH
+        rawpriv, _ = BTCEngine.wif_to_privkey(priv)
+        addr = engine.privkey_to_address(rawpriv)
         jmprint('claimed address: ' + addr, "info")
         res = jm_single().bc_interface.query_utxo_set([u])
         if len(res) != 1 or None in res:

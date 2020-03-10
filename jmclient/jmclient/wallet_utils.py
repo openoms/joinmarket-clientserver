@@ -15,7 +15,8 @@ from jmclient import (get_network, WALLET_IMPLEMENTATIONS, Storage, podle,
     LegacyWallet, SegwitWallet, is_native_segwit_mode, load_program_config,
     add_base_options, check_regtest)
 from jmclient.wallet_service import WalletService
-from jmbase.support import get_password, jmprint, EXIT_FAILURE, EXIT_ARGERROR
+from jmbase.support import (get_password, jmprint, EXIT_FAILURE,
+                            EXIT_ARGERROR, utxo_to_utxostr)
 
 from .cryptoengine import TYPE_P2PKH, TYPE_P2SH_P2WPKH, TYPE_P2WPKH
 from .output import fmt_utxo
@@ -353,22 +354,26 @@ def wallet_showutxos(wallet, showprivkey):
     utxos = wallet.get_utxos_by_mixdepth(includeconfs=True)
     for md in utxos:
         for u, av in utxos[md].items():
+            success, us = utxo_to_utxostr(u)
+            assert success
             key = wallet.get_key_from_addr(av['address'])
             tries = podle.get_podle_tries(u, key, max_tries)
             tries_remaining = max(0, max_tries - tries)
-            unsp[u] = {'address': av['address'], 'value': av['value'],
+            unsp[us] = {'address': av['address'], 'value': av['value'],
                        'tries': tries, 'tries_remaining': tries_remaining,
                        'external': False,
                        'confirmations': av['confs']}
             if showprivkey:
-                unsp[u]['privkey'] = wallet.get_wif_path(av['path'])
+                unsp[us]['privkey'] = wallet.get_wif_path(av['path'])
 
     used_commitments, external_commitments = podle.get_podle_commitments()
     for u, ec in iteritems(external_commitments):
+        success, us = utxo_to_utxostr(u)
+        assert success
         tries = podle.get_podle_tries(utxo=u, max_tries=max_tries,
                                           external=True)
         tries_remaining = max(0, max_tries - tries)
-        unsp[u] = {'tries': tries, 'tries_remaining': tries_remaining,
+        unsp[us] = {'tries': tries, 'tries_remaining': tries_remaining,
                    'external': True}
 
     return json.dumps(unsp, indent=4)
@@ -415,7 +420,7 @@ def wallet_display(wallet_service, showprivkey, displayall=False,
     acctlist = []
     # TODO - either optionally not show disabled utxos, or
     # mark them differently in display (labels; colors)
-    utxos = wallet_service.get_utxos_by_mixdepth(include_disabled=True, hexfmt=False)
+    utxos = wallet_service.get_utxos_by_mixdepth(include_disabled=True)
     for m in range(wallet_service.mixdepth + 1):
         branchlist = []
         for forchange in [0, 1]:
