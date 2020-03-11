@@ -688,7 +688,6 @@ class Taker(object):
                     too_small.append(utxos[i])
                 if valid_age and valid_amt:
                     newresults.append(utxos[i])
-
             return newresults, too_old, too_small
 
         def priv_utxo_pairs_from_utxos(utxos, age, amt):
@@ -843,7 +842,7 @@ class Taker(object):
         # Takers process only in series, so this should not occur:
         assert self.latest_tx is not None
         # check if the transaction matches our created tx:
-        if txd['outs'] != self.latest_tx['outs']:
+        if txd.vout != self.latest_tx.vout:
             return False
         return True
 

@@ -646,10 +646,11 @@ class BaseWallet(object):
         return (removed_utxos, added_utxos)
 
     def select_utxos(self, mixdepth, amount, utxo_filter=None,
-                      select_fn=None, maxheight=None):
+                      select_fn=None, maxheight=None, includeaddr=False):
         """
         Select a subset of available UTXOS for a given mixdepth whose value is
-        greater or equal to amount.
+        greater or equal to amount. If `includeaddr` is True, adds an `address`
+        key to the returned dict.
 
         args:
             mixdepth: int, mixdepth to select utxos from, must be smaller or
@@ -660,6 +661,7 @@ class BaseWallet(object):
 
         returns:
             {(txid, index): {'script': bytes, 'path': tuple, 'value': int}}
+
         """
         assert isinstance(mixdepth, numbers.Integral)
         assert isinstance(amount, numbers.Integral)
@@ -675,6 +677,8 @@ class BaseWallet(object):
 
         for data in ret.values():
             data['script'] = self.get_script_from_path(data['path'])
+            if includeaddr:
+                data["address"] = self.get_address_from_path(data["path"])
         return ret
 
     def disable_utxo(self, txid, index, disable=True):

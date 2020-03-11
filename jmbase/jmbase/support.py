@@ -239,9 +239,6 @@ def listchanger(l):
 
 def dictchanger(d):
     rdict = {}
-    #print("dictchanger trying to process this dict: ")
-    #from pprint import pformat
-    #print(pformat(d))
     for k, v in d.items():
         if isinstance(v, dict):
             rdict[cv(k)] = dictchanger(v)

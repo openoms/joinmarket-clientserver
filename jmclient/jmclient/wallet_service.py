@@ -675,7 +675,7 @@ class WalletService(Service):
             return self.current_blockheight - minconfs + 1
 
     def select_utxos(self, mixdepth, amount, utxo_filter=None, select_fn=None,
-                     minconfs=None):
+                     minconfs=None, includeaddr=False):
         """ Request utxos from the wallet in a particular mixdepth to satisfy
         a certain total amount, optionally set the selector function (or use
         the currently configured function set by the wallet, and optionally
@@ -683,26 +683,8 @@ class WalletService(Service):
         unconfirmed are allowed).
         """
         return self.wallet.select_utxos(mixdepth, amount, utxo_filter=utxo_filter,
-                select_fn=select_fn, maxheight=self.minconfs_to_maxheight(minconfs))
-
-    def select_utxos_textkeyed(self, mixdepth, amount, utxo_filter=None, select_fn=None,
-                     minconfs=None):
-        """ As for select_utxos, but with two changes in return value:
-        (1) return 'address' key in result dict
-        (2) keys for dict are hexlified txid:n instead of (txid bytes, int).
-        """
-        utxo_filter_new = None
-        if utxo_filter:
-            utxo_filter_new = [(unhexlify(utxo[:64]), int(utxo[65:]))
-                               for utxo in utxo_filter]
-        ret = self.select_utxos(mixdepth, amount, utxo_filter_new, select_fn,
-                                 minconfs=minconfs)
-        ret_conv = {}
-        for utxo, data in ret.items():
-            addr = self.get_address_from_path(data['path'])
-            utxo_txt = binascii.hexlify(utxo[0]).decode('ascii') + ':' + str(utxo[1])
-            ret_conv[utxo_txt] = {'address': addr, 'value': data['value']}
-        return ret_conv
+                select_fn=select_fn, maxheight=self.minconfs_to_maxheight(minconfs),
+                includeaddr=includeaddr)
 
     def get_balance_by_mixdepth(self, verbose=True,
                                 include_disabled=False,

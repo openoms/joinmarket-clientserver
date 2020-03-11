@@ -15,7 +15,7 @@ import hashlib
 import os
 import sys
 from jmbase import (get_log, EXIT_FAILURE, hextobin, bintohex,
-                    utxo_to_utxostr)
+                    utxo_to_utxostr, dictchanger)
 from jmclient import (jm_single, get_irc_mchannels,
                       RegtestBitcoinCoreInterface)
 import jmbitcoin as btc
@@ -245,11 +245,17 @@ class JMMakerClientProtocol(JMClientProtocol):
             jlog.info("Maker refuses to continue on receiving auth.")
         else:
             utxos, auth_pub, cj_addr, change_addr, btc_sig = retval[1:]
-            utxos_str = [utxo_to_utxostr(u) for u in utxos]
+            # json does not allow non-string keys:
+            utxos_strkeyed = {}
+            for k in utxos:
+                success, u = utxo_to_utxostr(k)
+                assert success
+                utxos_strkeyed[u] = {"value": utxos[k]["value"],
+                                     "address": utxos[k]["address"]}
             auth_pub_hex = bintohex(auth_pub)
             d = self.callRemote(commands.JMIOAuth,
                                 nick=nick,
-                                utxolist=json.dumps(utxos_str),
+                                utxolist=json.dumps(utxos_strkeyed),
                                 pubkey=auth_pub_hex,
                                 cjaddr=cj_addr,
                                 changeaddr=change_addr,

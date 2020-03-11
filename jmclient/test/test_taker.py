@@ -57,13 +57,16 @@ class DummyWallet(SegwitLegacyWallet):
         return retval
 
     def select_utxos(self, mixdepth, amount, utxo_filter=None, select_fn=None,
-                     maxheight=None):
+                     maxheight=None, includeaddr=False):
         if amount > self.get_balance_by_mixdepth()[mixdepth]:
             raise Exception("Not enough funds")
         # comment as for get_utxos_by_mixdepth:
         retval = {}
         for k, v in t_utxos_by_mixdepth[mixdepth].items():
-            retval[utxostr_to_utxo(k)[1]] = v
+            success, u = utxostr_to_utxo(k)
+            assert success
+            retval[u] = v
+            retval[u]["script"] = self.addr_to_script(retval[u]["address"])
         return retval
 
     def get_internal_addr(self, mixing_depth, bci=None):
@@ -228,7 +231,7 @@ def test_auth_pub_not_found(setup_taker):
          2, False, None, None), #trigger sub dust change for taker
         #edge case triggers that do fail
         ([(0, 199851000, 3, "mnsquzxrHXpFsZeL42qwbKdCP2y1esN3qw", 0, NO_ROUNDING)], False, False,
-         2, False, None, None), #trigger negative change        
+         2, False, None, None), #trigger negative change
         ([(0, 199599800, 3, "mnsquzxrHXpFsZeL42qwbKdCP2y1esN3qw", 0, NO_ROUNDING)], False, False,
          2, False, None, None), #trigger sub dust change for maker
         ([(0, 20000000, 3, "INTERNAL", 0, NO_ROUNDING)], True, False,
@@ -236,7 +239,7 @@ def test_auth_pub_not_found(setup_taker):
         ([(0, 20000000, 3, "INTERNAL", 0, NO_ROUNDING)], False, False,
          7, False, None, None), #test not enough cp
         ([(0, 80000000, 3, "INTERNAL", 0, NO_ROUNDING)], False, False,
-         2, False, None, "30000"), #test failed commit       
+         2, False, None, "30000"), #test failed commit
         ([(0, 20000000, 3, "INTERNAL", 0, NO_ROUNDING)], False, False,
          2, True, None, None), #test unauthed response
         ([(0, 5000000000, 3, "mnsquzxrHXpFsZeL42qwbKdCP2y1esN3qw", 0, NO_ROUNDING)], False, True,
@@ -374,20 +377,26 @@ def test_unconfirm_confirm(setup_taker, schedule_len):
     The exception to the above is that the txd passed in must match
     self.latest_tx, so we use a dummy value here for that.
     """
+    class DummyTx(object):
+        pass
     test_unconfirm_confirm.txflag = True
     def finished_for_confirms(res, fromtx=False, waittime=0, txdetails=None):
         assert res #confirmed should always send true
         test_unconfirm_confirm.txflag = fromtx
 
     taker = get_taker(schedule_len=schedule_len, on_finished=finished_for_confirms)
-    taker.latest_tx = {"outs": "blah"}
-    taker.unconfirm_callback({"ins": "foo", "outs": "blah"}, "b")
+    taker.latest_tx = DummyTx()
+    taker.latest_tx.vout = "blah"
+    fake_txd = DummyTx()
+    fake_txd.vin = "foo"
+    fake_txd.vout = "blah"
+    taker.unconfirm_callback(fake_txd, "b")
     for i in range(schedule_len-1):
         taker.schedule_index += 1
-        fromtx = taker.confirm_callback({"ins": "foo", "outs": "blah"}, "b", 1)
+        fromtx = taker.confirm_callback(fake_txd, "b", 1)
         assert test_unconfirm_confirm.txflag
     taker.schedule_index += 1
-    fromtx = taker.confirm_callback({"ins": "foo", "outs": "blah"}, "b", 1)
+    fromtx = taker.confirm_callback(fake_txd, "b", 1)
     assert not test_unconfirm_confirm.txflag
     
 @pytest.mark.parametrize(
