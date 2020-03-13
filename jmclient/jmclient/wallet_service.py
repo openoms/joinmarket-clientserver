@@ -128,9 +128,9 @@ class WalletService(Service):
         and return type boolean.
         `txinfo` - either a txid expected for the transaction, if
         known, or a tuple of the ordered output set, of the form
-        (('script': script), ('value': value), ..). This can be
-        constructed from jmbitcoin.deserialize output, key "outs",
-        using tuple(). See WalletService.transaction_monitor().
+        ((CScript, int), ..). This is be constructed from the
+        CMutableTransaction vout list.
+        See WalletService.transaction_monitor().
         `cb_type` - must be one of "all", "unconfirmed", "confirmed";
         the first type will be called back once for every new
         transaction, the second only once when the number of
@@ -288,16 +288,9 @@ class WalletService(Service):
                     f(txd, txid)
 
             # The tuple given as the second possible key for the dict
-            # is such because dict keys must be hashable types, so a simple
-            # replication of the entries in the list tx["outs"], where tx
-            # was generated via jmbitcoin.deserialize, is unacceptable to
-            # Python, since they are dicts. However their keyset is deterministic
-            # so it is sufficient to convert these dicts to tuples with fixed
-            # ordering, thus it can be used as a key into the self.callbacks
-            # dicts. (This is needed because txid is not always available
+            # is such because txid is not always available
             # at the time of callback registration).
-            possible_keys = [txid, tuple(
-                    (str(x.scriptPubKey), x.nValue) for x in txd.vout)]
+            possible_keys = [txid, tuple((x.scriptPubKey, x.nValue) for x in txd.vout)]
 
             # note that len(added_utxos) > 0 is not a sufficient condition for
             # the tx being new, since wallet.add_new_utxos will happily re-add
