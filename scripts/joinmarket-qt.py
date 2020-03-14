@@ -1905,7 +1905,7 @@ if isinstance(jm_single().bc_interface, RegtestBitcoinCoreInterface):
     jm_single().bc_interface.simulating = True
     jm_single().maker_timeout_sec = 15
     #trigger start with a fake tx
-    jm_single().bc_interface.pushtx("00"*20)
+    jm_single().bc_interface.pushtx(b"\x00"*20)
 
 #prepare for logging
 for dname in ['logs', 'wallets', 'cmtdata']:
