@@ -1452,6 +1452,12 @@ class JMMainWindow(QMainWindow):
         done = False
 
         def privkeys_thread():
+            # To explain this (given setting was already done in
+            # load_program_config), see:
+            # https://github.com/Simplexum/python-bitcointx/blob/9f1fa67a5445f8c187ef31015a4008bc5a048eea/bitcointx/__init__.py#L242-L243
+            # note, we ignore the return value as we only want to apply
+            # the chainparams setting logic:
+            get_blockchain_interface_instance(jm_single().config)
             for addr in addresses:
                 time.sleep(0.1)
                 if done:
