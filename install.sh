@@ -39,7 +39,8 @@ deps_install ()
         'libtool' \
         'libgmp-dev' \
         'python3-dev' \
-        'python3-pip' )
+        'python3-pip' \
+        'libffi-dev' )
 
     if ! is_python3; then
         echo "Python 2 is no longer supported. Please use a compatible Python 3 version."
